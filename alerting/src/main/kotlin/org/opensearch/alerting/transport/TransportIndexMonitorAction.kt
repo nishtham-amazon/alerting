@@ -31,6 +31,8 @@ import org.opensearch.alerting.MonitorMetadataService
 import org.opensearch.alerting.core.ScheduledJobIndices
 import org.opensearch.alerting.opensearchapi.suspendUntil
 import org.opensearch.alerting.service.DeleteMonitorService
+import org.opensearch.alerting.service.ExternalSchedulerService
+import org.opensearch.alerting.service.SchedulerRoutingResolver
 import org.opensearch.alerting.settings.AlertingSettings
 import org.opensearch.alerting.settings.AlertingSettings.Companion.ALERTING_MAX_MONITORS
 import org.opensearch.alerting.settings.AlertingSettings.Companion.INDEX_TIMEOUT
@@ -44,12 +46,14 @@ import org.opensearch.alerting.util.addUserBackendRolesFilter
 import org.opensearch.alerting.util.await
 import org.opensearch.alerting.util.getRoleFilterEnabled
 import org.opensearch.alerting.util.isADMonitor
+import org.opensearch.alerting.util.isUnsupportedMultiTenantMonitorType
 import org.opensearch.alerting.util.use
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
 import org.opensearch.common.settings.Settings
 import org.opensearch.common.unit.TimeValue
 import org.opensearch.common.xcontent.LoggingDeprecationHandler
+import org.opensearch.common.xcontent.XContentFactory
 import org.opensearch.common.xcontent.XContentHelper
 import org.opensearch.common.xcontent.XContentType
 import org.opensearch.commons.alerting.action.AlertingActions
@@ -59,6 +63,7 @@ import org.opensearch.commons.alerting.model.DocLevelMonitorInput
 import org.opensearch.commons.alerting.model.DocLevelMonitorInput.Companion.DOC_LEVEL_INPUT_FIELD
 import org.opensearch.commons.alerting.model.Monitor
 import org.opensearch.commons.alerting.model.MonitorMetadata
+import org.opensearch.commons.alerting.model.ScheduleJobPayload
 import org.opensearch.commons.alerting.model.ScheduledJob
 import org.opensearch.commons.alerting.model.ScheduledJob.Companion.SCHEDULED_JOBS_INDEX
 import org.opensearch.commons.alerting.model.SearchInput
@@ -116,6 +121,12 @@ class TransportIndexMonitorAction @Inject constructor(
     @Volatile private var maxActionThrottle = MAX_ACTION_THROTTLE_VALUE.get(settings)
     @Volatile private var allowList = ALLOW_LIST.get(settings)
     @Volatile override var filterByEnabled = AlertingSettings.FILTER_BY_BACKEND_ROLES.get(settings)
+    @Volatile private var externalSchedulerEnabled = AlertingSettings.EXTERNAL_SCHEDULER_ENABLED.get(settings)
+    @Volatile private var externalSchedulerAccountId = AlertingSettings.EXTERNAL_SCHEDULER_ACCOUNT_ID.get(settings)
+    @Volatile private var jobQueueName = AlertingSettings.JOB_QUEUE_NAME.get(settings)
+    @Volatile private var externalSchedulerRoleArn = AlertingSettings.EXTERNAL_SCHEDULER_ROLE_ARN.get(settings)
+
+    private val multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
 
     init {
         clusterService.clusterSettings.addSettingsUpdateConsumer(ALERTING_MAX_MONITORS) { maxMonitors = it }
@@ -124,6 +135,18 @@ class TransportIndexMonitorAction @Inject constructor(
         clusterService.clusterSettings.addSettingsUpdateConsumer(INDEX_TIMEOUT) { indexTimeout = it }
         clusterService.clusterSettings.addSettingsUpdateConsumer(MAX_ACTION_THROTTLE_VALUE) { maxActionThrottle = it }
         clusterService.clusterSettings.addSettingsUpdateConsumer(ALLOW_LIST) { allowList = it }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ENABLED) {
+            externalSchedulerEnabled = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ACCOUNT_ID) {
+            externalSchedulerAccountId = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.JOB_QUEUE_NAME) {
+            jobQueueName = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ROLE_ARN) {
+            externalSchedulerRoleArn = it
+        }
         listenFilterBySettingChange(clusterService)
     }
 
@@ -132,6 +155,18 @@ class TransportIndexMonitorAction @Inject constructor(
             ?: recreateObject(request, namedWriteableRegistry) {
                 IndexMonitorRequest(it)
             }
+
+        if (multiTenancyEnabled && transformedRequest.monitor.isUnsupportedMultiTenantMonitorType()) {
+            actionListener.onFailure(
+                AlertingException.wrap(
+                    OpenSearchStatusException(
+                        "${transformedRequest.monitor.monitorType} monitors are not allowed when multi-tenancy is enabled.",
+                        RestStatus.METHOD_NOT_ALLOWED
+                    )
+                )
+            )
+            return
+        }
 
         val user = readUserFromThreadContext(client)
 
@@ -565,6 +600,17 @@ class TransportIndexMonitorAction @Inject constructor(
                     throw t
                 }
 
+                // Create external schedule for monitor execution
+                if (externalSchedulerEnabled) {
+                    try {
+                        createExternalSchedule(request.monitor, tenantId)
+                    } catch (t: Exception) {
+                        log.error("Failed to create EB schedule for monitor ${indexResponse.id}. Rolling back.", t)
+                        cleanupMonitorAfterPartialFailure(request.monitor, indexResponse)
+                        throw t
+                    }
+                }
+
                 actionListener.onResponse(
                     IndexMonitorResponse(
                         indexResponse.id, indexResponse.version, indexResponse.seqNo,
@@ -761,6 +807,16 @@ class TransportIndexMonitorAction @Inject constructor(
                     )
                     MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
                 }
+                // Update external schedule with latest monitor config
+                if (externalSchedulerEnabled) {
+                    try {
+                        updateExternalSchedule(request.monitor, tenantId)
+                    } catch (t: Exception) {
+                        log.error("Failed to update EB schedule for monitor ${request.monitorId}", t)
+                        actionListener.onFailure(AlertingException.wrap(t))
+                        return
+                    }
+                }
                 actionListener.onResponse(
                     IndexMonitorResponse(
                         indexResponse.id, indexResponse.version, indexResponse.seqNo,
@@ -783,5 +839,53 @@ class TransportIndexMonitorAction @Inject constructor(
             }
             return null
         }
+
+        /**
+         * Reads scheduler routing info from plugin settings (with optional ThreadContext
+         * override for account id) and creates an external schedule.
+         * No-op when required settings are blank.
+         */
+        private fun createExternalSchedule(monitor: Monitor, tenantId: String?) {
+            val routing = resolveRouting() ?: return
+            val targetInput = buildScheduleJobPayloadJson(monitor)
+            ExternalSchedulerService.createSchedule(monitor, routing, targetInput)
+        }
+
+        /**
+         * Reads scheduler routing info from plugin settings (with optional ThreadContext
+         * override for account id) and updates the external schedule. Always refreshes
+         * Target.Input with the latest monitor config.
+         */
+        private fun updateExternalSchedule(monitor: Monitor, tenantId: String?) {
+            val routing = resolveRouting() ?: return
+            val targetInput = buildScheduleJobPayloadJson(monitor)
+            ExternalSchedulerService.updateSchedule(monitor, routing, targetInput)
+        }
+
+        /**
+         * Builds a JSON string matching [ScheduleJobPayload] schema for the EB schedule target input.
+         * Uses the EB placeholder for job_start_time which the scheduler replaces at invocation time
+         * with a real ISO-8601 timestamp that [ScheduleJobPayload.parse] can deserialize.
+         */
+        private fun buildScheduleJobPayloadJson(monitor: Monitor): String {
+            val monitorConfigBuilder = XContentFactory.jsonBuilder()
+            monitor.toXContentWithUser(monitorConfigBuilder, ToXContent.EMPTY_PARAMS)
+            val payload = ScheduleJobPayload(
+                monitorId = monitor.id,
+                jobStartTime = ExternalSchedulerService.EB_SCHEDULED_TIME_PLACEHOLDER,
+                monitorConfig = monitorConfigBuilder.toString()
+            )
+            val builder = XContentFactory.jsonBuilder()
+            payload.toXContent(builder, ToXContent.EMPTY_PARAMS)
+            return builder.toString()
+        }
+
+        private fun resolveRouting(): SchedulerRoutingResolver.Routing? = SchedulerRoutingResolver.resolve(
+            settingsAccountId = externalSchedulerAccountId,
+            settingsQueueName = jobQueueName,
+            settingsRoleArn = externalSchedulerRoleArn,
+            threadContextAccountIdOverride = client.threadPool().threadContext
+                .getTransient<String>(ExternalSchedulerService.SCHEDULER_ACCOUNT_ID_KEY)
+        )
     }
 }
