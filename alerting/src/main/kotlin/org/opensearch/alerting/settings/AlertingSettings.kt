@@ -380,6 +380,12 @@ class AlertingSettings {
             Setting.Property.NodeScope, Setting.Property.Dynamic
         )
 
+        /** IAM role ARN that EventBridge Scheduler assumes at fire time (Target.roleArn). Required when external scheduler is enabled. */
+        val EXTERNAL_SCHEDULER_EXECUTION_ROLE_ARN = Setting.simpleString(
+            "plugins.alerting.external_scheduler.execution_role_arn",
+            Setting.Property.NodeScope, Setting.Property.Dynamic
+        )
+
         /** AWS account ID that hosts the job queues available for polling. */
         val JOB_QUEUE_ACCOUNT_ID = Setting.simpleString(
             "plugins.alerting.external_scheduler.job_queue_account_id",
@@ -402,6 +408,13 @@ class AlertingSettings {
         /** Key name in monitor metadata whose value is used as the SQS MessageGroupId for fair queuing. */
         val JOB_QUEUE_MESSAGE_GROUP_KEY_NAME = Setting.simpleString(
             "plugins.alerting.external_scheduler.job_queue_message_group_key_name",
+            Setting.Property.NodeScope, Setting.Property.Dynamic
+        )
+
+        /** Mappings from Monitor target type to opensearch service name, used in MonitorJobPoller
+         * to populate thread context with required Monitor target information */
+        val TARGET_TYPE_TO_SERVICE_NAME = Setting.groupSetting(
+            "plugins.alerting.monitor.target_type_to_service_name.",
             Setting.Property.NodeScope, Setting.Property.Dynamic
         )
     }

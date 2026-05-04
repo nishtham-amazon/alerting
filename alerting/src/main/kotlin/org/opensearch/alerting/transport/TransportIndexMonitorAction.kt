@@ -38,6 +38,7 @@ import org.opensearch.alerting.settings.AlertingSettings.Companion.ALERTING_MAX_
 import org.opensearch.alerting.settings.AlertingSettings.Companion.INDEX_TIMEOUT
 import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_ACTION_THROTTLE_VALUE
 import org.opensearch.alerting.settings.AlertingSettings.Companion.MAX_TRIGGERS_PER_MONITOR
+import org.opensearch.alerting.settings.AlertingSettings.Companion.MULTI_TENANT_TRIGGER_EVAL_ENABLED
 import org.opensearch.alerting.settings.AlertingSettings.Companion.REQUEST_TIMEOUT
 import org.opensearch.alerting.settings.DestinationSettings.Companion.ALLOW_LIST
 import org.opensearch.alerting.util.DocLevelMonitorQueries
@@ -116,6 +117,7 @@ class TransportIndexMonitorAction @Inject constructor(
 
     @Volatile private var maxMonitors = ALERTING_MAX_MONITORS.get(settings)
     @Volatile private var maxTriggersPerMonitor = MAX_TRIGGERS_PER_MONITOR.get(settings)
+    @Volatile private var multiTenantTriggerEvalEnabled = MULTI_TENANT_TRIGGER_EVAL_ENABLED.get(settings)
     @Volatile private var requestTimeout = REQUEST_TIMEOUT.get(settings)
     @Volatile private var indexTimeout = INDEX_TIMEOUT.get(settings)
     @Volatile private var maxActionThrottle = MAX_ACTION_THROTTLE_VALUE.get(settings)
@@ -125,12 +127,16 @@ class TransportIndexMonitorAction @Inject constructor(
     @Volatile private var externalSchedulerAccountId = AlertingSettings.EXTERNAL_SCHEDULER_ACCOUNT_ID.get(settings)
     @Volatile private var jobQueueName = AlertingSettings.JOB_QUEUE_NAME.get(settings)
     @Volatile private var externalSchedulerRoleArn = AlertingSettings.EXTERNAL_SCHEDULER_ROLE_ARN.get(settings)
+    @Volatile private var externalSchedulerExecutionRoleArn = AlertingSettings.EXTERNAL_SCHEDULER_EXECUTION_ROLE_ARN.get(settings)
 
     private val multiTenancyEnabled = AlertingSettings.MULTI_TENANCY_ENABLED.get(settings)
 
     init {
         clusterService.clusterSettings.addSettingsUpdateConsumer(ALERTING_MAX_MONITORS) { maxMonitors = it }
         clusterService.clusterSettings.addSettingsUpdateConsumer(MAX_TRIGGERS_PER_MONITOR) { maxTriggersPerMonitor = it }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(MULTI_TENANT_TRIGGER_EVAL_ENABLED) {
+            multiTenantTriggerEvalEnabled = it
+        }
         clusterService.clusterSettings.addSettingsUpdateConsumer(REQUEST_TIMEOUT) { requestTimeout = it }
         clusterService.clusterSettings.addSettingsUpdateConsumer(INDEX_TIMEOUT) { indexTimeout = it }
         clusterService.clusterSettings.addSettingsUpdateConsumer(MAX_ACTION_THROTTLE_VALUE) { maxActionThrottle = it }
@@ -146,6 +152,9 @@ class TransportIndexMonitorAction @Inject constructor(
         }
         clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_ROLE_ARN) {
             externalSchedulerRoleArn = it
+        }
+        clusterService.clusterSettings.addSettingsUpdateConsumer(AlertingSettings.EXTERNAL_SCHEDULER_EXECUTION_ROLE_ARN) {
+            externalSchedulerExecutionRoleArn = it
         }
         listenFilterBySettingChange(clusterService)
     }
@@ -360,6 +369,12 @@ class TransportIndexMonitorAction @Inject constructor(
         }
 
         fun start() {
+            // When multi-tenancy is enabled, monitors are stored in remote metadata —
+            // skip local scheduled-job index creation and mapping updates.
+            if (multiTenancyEnabled) {
+                prepareMonitorIndexing()
+                return
+            }
             if (!scheduledJobIndices.scheduledJobIndexExists()) {
                 scheduledJobIndices.initScheduledJobIndex(object : ActionListener<CreateIndexResponse> {
                     override fun onResponse(response: CreateIndexResponse) {
@@ -429,6 +444,11 @@ class TransportIndexMonitorAction @Inject constructor(
                 scope.launch {
                     updateMonitor()
                 }
+            } else if (multiTenancyEnabled) {
+                // Skip local scheduled-job index search for monitor count when multi-tenancy is enabled.
+                scope.launch {
+                    indexMonitor()
+                }
             } else {
                 val query = QueryBuilders.boolQuery().filter(QueryBuilders.termQuery("${Monitor.MONITOR_TYPE}.type", Monitor.MONITOR_TYPE))
                 val searchSource = SearchSourceBuilder().query(query).timeout(requestTimeout)
@@ -452,6 +472,14 @@ class TransportIndexMonitorAction @Inject constructor(
         private fun validateTriggerCount(monitor: Monitor) {
             require(monitor.triggers.size <= maxTriggersPerMonitor) {
                 "The current cluster settings only allow up to $maxTriggersPerMonitor triggers per monitor."
+            }
+            if (multiTenantTriggerEvalEnabled &&
+                Monitor.MonitorType.valueOf(monitor.monitorType.uppercase(Locale.ROOT)) ==
+                Monitor.MonitorType.BUCKET_LEVEL_MONITOR
+            ) {
+                require(monitor.triggers.size <= 1) {
+                    "Bucket-level monitors only support 1 trigger when remote trigger evaluation is enabled."
+                }
             }
         }
 
@@ -571,33 +599,37 @@ class TransportIndexMonitorAction @Inject constructor(
                 }
                 val indexResponse = putResponse.indexResponse()
                     ?: throw OpenSearchStatusException("No index response from SDK", RestStatus.INTERNAL_SERVER_ERROR)
-                var metadata: MonitorMetadata?
-                try { // delete monitor if metadata creation fails, log the right error and re-throw the error to fail listener
-                    request.monitor = request.monitor.copy(id = indexResponse.id)
-                    var (monitorMetadata: MonitorMetadata, created: Boolean) = MonitorMetadataService.getOrCreateMetadata(request.monitor)
-                    if (created == false) {
-                        log.warn("Metadata doc id:${monitorMetadata.id} exists, but it shouldn't!")
+                request.monitor = request.monitor.copy(id = indexResponse.id)
+
+                if (!multiTenancyEnabled) {
+                    var metadata: MonitorMetadata?
+                    try {
+                        var (monitorMetadata: MonitorMetadata, created: Boolean) =
+                            MonitorMetadataService.getOrCreateMetadata(request.monitor)
+                        if (created == false) {
+                            log.warn("Metadata doc id:${monitorMetadata.id} exists, but it shouldn't!")
+                        }
+                        metadata = monitorMetadata
+                    } catch (t: Exception) {
+                        log.error("failed to create metadata for monitor ${indexResponse.id}. deleting monitor")
+                        cleanupMonitorAfterPartialFailure(request.monitor, indexResponse)
+                        throw t
                     }
-                    metadata = monitorMetadata
-                } catch (t: Exception) {
-                    log.error("failed to create metadata for monitor ${indexResponse.id}. deleting monitor")
-                    cleanupMonitorAfterPartialFailure(request.monitor, indexResponse)
-                    throw t
-                }
-                try {
-                    if (
-                        request.monitor.isMonitorOfStandardType() &&
-                        Monitor.MonitorType.valueOf(request.monitor.monitorType.uppercase(Locale.ROOT)) ==
-                        Monitor.MonitorType.DOC_LEVEL_MONITOR
-                    ) {
-                        indexDocLevelMonitorQueries(request.monitor, indexResponse.id, metadata, request.refreshPolicy)
+                    try {
+                        if (
+                            request.monitor.isMonitorOfStandardType() &&
+                            Monitor.MonitorType.valueOf(request.monitor.monitorType.uppercase(Locale.ROOT)) ==
+                            Monitor.MonitorType.DOC_LEVEL_MONITOR
+                        ) {
+                            indexDocLevelMonitorQueries(request.monitor, indexResponse.id, metadata, request.refreshPolicy)
+                        }
+                        // When inserting queries in queryIndex we could update sourceToQueryIndexMapping
+                        MonitorMetadataService.upsertMetadata(metadata, updating = true)
+                    } catch (t: Exception) {
+                        log.error("failed to index doc level queries monitor ${indexResponse.id}. deleting monitor", t)
+                        cleanupMonitorAfterPartialFailure(request.monitor, indexResponse)
+                        throw t
                     }
-                    // When inserting queries in queryIndex we could update sourceToQueryIndexMapping
-                    MonitorMetadataService.upsertMetadata(metadata, updating = true)
-                } catch (t: Exception) {
-                    log.error("failed to index doc level queries monitor ${indexResponse.id}. deleting monitor", t)
-                    cleanupMonitorAfterPartialFailure(request.monitor, indexResponse)
-                    throw t
                 }
 
                 // Create external schedule for monitor execution
@@ -777,35 +809,37 @@ class TransportIndexMonitorAction @Inject constructor(
                     isDocLevelMonitorRestarted = true
                 }
 
-                var updatedMetadata: MonitorMetadata
-                val (metadata, created) = MonitorMetadataService.getOrCreateMetadata(
-                    request.monitor,
-                    forceCreateLastRunContext = isDocLevelMonitorRestarted
-                )
-
-                // Recreate runContext if metadata exists
-                // Delete and insert all queries from/to queryIndex
-
-                if (!created &&
-                    currentMonitor.isMonitorOfStandardType() &&
-                    Monitor.MonitorType.valueOf(currentMonitor.monitorType.uppercase(Locale.ROOT)) == Monitor.MonitorType.DOC_LEVEL_MONITOR
-                ) {
-                    updatedMetadata = MonitorMetadataService.recreateRunContext(metadata, currentMonitor)
-                    if (docLevelMonitorQueries.docLevelQueryIndexExists(currentMonitor.dataSources)) {
-                        client.suspendUntil<Client, BulkByScrollResponse> {
-                            DeleteByQueryRequestBuilder(client, DeleteByQueryAction.INSTANCE)
-                                .source(currentMonitor.dataSources.queryIndex)
-                                .filter(QueryBuilders.matchQuery("monitor_id", currentMonitor.id))
-                                .execute(it)
-                        }
-                    }
-                    indexDocLevelMonitorQueries(
+                if (!multiTenancyEnabled) {
+                    var updatedMetadata: MonitorMetadata
+                    val (metadata, created) = MonitorMetadataService.getOrCreateMetadata(
                         request.monitor,
-                        currentMonitor.id,
-                        updatedMetadata,
-                        request.refreshPolicy
+                        forceCreateLastRunContext = isDocLevelMonitorRestarted
                     )
-                    MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+
+                    // Recreate runContext if metadata exists
+                    // Delete and insert all queries from/to queryIndex
+
+                    val isDocLevelMonitor = currentMonitor.isMonitorOfStandardType() &&
+                        Monitor.MonitorType.valueOf(currentMonitor.monitorType.uppercase(Locale.ROOT)) ==
+                        Monitor.MonitorType.DOC_LEVEL_MONITOR
+                    if (!created && isDocLevelMonitor) {
+                        updatedMetadata = MonitorMetadataService.recreateRunContext(metadata, currentMonitor)
+                        if (docLevelMonitorQueries.docLevelQueryIndexExists(currentMonitor.dataSources)) {
+                            client.suspendUntil<Client, BulkByScrollResponse> {
+                                DeleteByQueryRequestBuilder(client, DeleteByQueryAction.INSTANCE)
+                                    .source(currentMonitor.dataSources.queryIndex)
+                                    .filter(QueryBuilders.matchQuery("monitor_id", currentMonitor.id))
+                                    .execute(it)
+                            }
+                        }
+                        indexDocLevelMonitorQueries(
+                            request.monitor,
+                            currentMonitor.id,
+                            updatedMetadata,
+                            request.refreshPolicy
+                        )
+                        MonitorMetadataService.upsertMetadata(updatedMetadata, updating = true)
+                    }
                 }
                 // Update external schedule with latest monitor config
                 if (externalSchedulerEnabled) {
@@ -884,6 +918,7 @@ class TransportIndexMonitorAction @Inject constructor(
             settingsAccountId = externalSchedulerAccountId,
             settingsQueueName = jobQueueName,
             settingsRoleArn = externalSchedulerRoleArn,
+            settingsExecutionRoleArn = externalSchedulerExecutionRoleArn,
             threadContextAccountIdOverride = client.threadPool().threadContext
                 .getTransient<String>(ExternalSchedulerService.SCHEDULER_ACCOUNT_ID_KEY)
         )
